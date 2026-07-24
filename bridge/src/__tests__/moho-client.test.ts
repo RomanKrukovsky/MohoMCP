@@ -19,9 +19,13 @@ function createTestIpcDir(): string {
 function cleanupTestIpcDir(dir: string): void {
   if (!dir || !fs.existsSync(dir)) return;
   for (const f of fs.readdirSync(dir)) {
-    fs.unlinkSync(path.join(dir, f));
+    try {
+      fs.unlinkSync(path.join(dir, f));
+    } catch {}
   }
-  fs.rmdirSync(dir);
+  try {
+    fs.rmdirSync(dir);
+  } catch {}
 }
 
 /** Write a status.json that indicates the server is running. */
