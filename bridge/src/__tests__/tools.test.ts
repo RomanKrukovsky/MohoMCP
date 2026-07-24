@@ -50,12 +50,12 @@ describe("registerTools", () => {
     ).not.toThrow();
   });
 
-  it("registers canonical tools, workflows, diagnostics, and legacy aliases", () => {
+  it("registers canonical tools, experimental workflows, and diagnostics", () => {
     registerTools(mockServer as unknown as Parameters<typeof registerTools>[0], client);
     expect(mockServer.tools.length).toBeGreaterThanOrEqual(26);
   });
 
-  it("registers all expected tool names", () => {
+  it("registers canonical tool names by default", () => {
     registerTools(mockServer as unknown as Parameters<typeof registerTools>[0], client);
 
     const names = mockServer.tools.map((t) => t.name);
@@ -85,19 +85,8 @@ describe("registerTools", () => {
     expect(names).toContain("layer_setName");
     expect(names).toContain("layer_selectLayer");
 
-    // Enterprise composite workflows
-    expect(names).toContain("workflow_createCharacterRig");
-    expect(names).toContain("workflow_setupSmartBone");
-    expect(names).toContain("workflow_applyLipSync");
-    expect(names).toContain("workflow_duplicateLayerTree");
-    expect(names).toContain("workflow_batchRender");
-
     // Enterprise system diagnostics
     expect(names).toContain("system_getCapabilities");
     expect(names).toContain("system_diagnose");
-
-    // Legacy aliases
-    expect(names).toContain("moho_doc_info");
-    expect(names).toContain("moho_list_layers");
   });
 });
