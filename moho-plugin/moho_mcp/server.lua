@@ -319,15 +319,15 @@ local function processRequest(requestStr, moho)
 end
 
 --- Poll for incoming request files and process them.
+-- Scans from 1 to maxProbedId so no request ID is ever skipped.
 function server.poll(moho)
     if not isRunning then
         return
     end
 
-    local maxProbedId = lastSeenMaxId + 20
-    local startId = math.max(1, lastSeenMaxId - 50)
+    local maxProbedId = math.max(20, lastSeenMaxId + 20)
 
-    for id = startId, maxProbedId do
+    for id = 1, maxProbedId do
         local reqPath = ipcDir .. "req_" .. id .. ".json"
         if fileExists(reqPath) then
             if id > lastSeenMaxId then
