@@ -12,6 +12,7 @@ local validator = nil
 -- Server state
 local isRunning = false
 local ipcDir = ""
+local lastSeenMaxId = 0
 
 -- Tool handler registry: method name -> function(moho, params) -> result, err
 local handlers = {}
@@ -41,9 +42,31 @@ function server.getHandler(method)
     return handlers[method]
 end
 
---- Get the IPC directory path.
--- Uses TEMP/moho-mcp/ on Windows, /tmp/moho-mcp/ on others.
+--- Get the primary IPC directory path.
+-- Uses Application Support / LocalAppData primary folder. Overridden by MOHO_IPC_DIR.
 local function getIpcDir()
+    local override = os.getenv("MOHO_IPC_DIR") or os.getenv("MOHO_MCP_IPC_DIR")
+    if override and override ~= "" then
+        if not override:match("[/\\]$") then
+            override = override .. SEP
+        end
+        return override
+    end
+
+    local home = os.getenv("HOME") or os.getenv("USERPROFILE") or ""
+    if SEP == "/" then
+        if home ~= "" then
+            return home .. "/Library/Application Support/MohoMCP/ipc/"
+        end
+    else
+        local localAppData = os.getenv("LOCALAPPDATA")
+        if localAppData and localAppData ~= "" then
+            return localAppData .. "\\MohoMCP\\ipc\\"
+        elseif home ~= "" then
+            return home .. "\\AppData\\Local\\MohoMCP\\ipc\\"
+        end
+    end
+
     local tmp = os.getenv("TEMP") or os.getenv("TMP") or os.getenv("TMPDIR") or "/tmp"
     return tmp .. SEP .. "moho-mcp" .. SEP
 end
@@ -87,26 +110,20 @@ local function writeFile(path, content)
     return true
 end
 
---- Create a directory without spawning a visible cmd window.
-local function mkdirp(path)
-    -- Use io.popen instead of os.execute to avoid visible cmd windows
+--- Create a directory safely using absolute binary paths to bypass macOS PATH restrictions.
+local function mkdirp(dirPath)
+    local cleanPath = dirPath:gsub("[/\\]+$", "")
     local cmd
     if SEP == "\\" then
-        cmd = 'cmd /c mkdir "' .. path .. '" 2>NUL'
+        cmd = 'cmd.exe /c mkdir "' .. cleanPath .. '" 2>NUL'
     else
-        cmd = 'mkdir -p "' .. path .. '" 2>/dev/null'
+        cmd = '/bin/mkdir -p "' .. cleanPath .. '" 2>/dev/null || /usr/bin/mkdir -p "' .. cleanPath .. '" 2>/dev/null'
     end
     local handle = io.popen(cmd)
     if handle then handle:close() end
 end
 
 --- Find request/response files by probing for known ID patterns.
---- Pure Lua — no shell commands, no visible windows.
---- The bridge uses incrementing integer IDs (1, 2, 3, …) so we
---- scan a range of IDs and check if the file exists via io.open.
---- Scan a fixed window of IDs starting from 1.
---- On modern SSDs, probing ~200 files via io.open is <5ms.
---- The bridge resets its counter on restart, so IDs are typically low.
 local function findFilesByPrefix(dir, prefix)
     local files = {}
     local misses = 0
@@ -119,8 +136,7 @@ local function findFilesByPrefix(dir, prefix)
             misses = 0
         else
             misses = misses + 1
-            -- Stop after 100 consecutive misses (covers any reasonable gap)
-            if misses > 100 then
+            if misses > 10 then
                 break
             end
         end
@@ -128,14 +144,13 @@ local function findFilesByPrefix(dir, prefix)
     return files
 end
 
---- One-time wide scan to discover the current bridge ID range.
---- Called once at server start. Uses io.popen (single cmd window, one time only).
+--- One-time scan to discover the current bridge ID range.
 local function discoverCurrentIdRange(dir)
     local cmd
     if SEP == "\\" then
-        cmd = 'cmd /c dir /b "' .. dir .. 'req_*.json" 2>NUL'
+        cmd = 'cmd.exe /c dir /b "' .. dir .. 'req_*.json" 2>NUL'
     else
-        cmd = 'ls -1 "' .. dir .. '"req_*.json 2>/dev/null'
+        cmd = '/bin/ls -1 "' .. dir .. '"req_*.json 2>/dev/null || /usr/bin/ls -1 "' .. dir .. '"req_*.json 2>/dev/null'
     end
     local handle = io.popen(cmd)
     if handle then
@@ -150,11 +165,11 @@ local function discoverCurrentIdRange(dir)
         end
         handle:close()
     end
-    -- Also check response files for ID range
+
     if SEP == "\\" then
-        cmd = 'cmd /c dir /b "' .. dir .. 'resp_*.json" 2>NUL'
+        cmd = 'cmd.exe /c dir /b "' .. dir .. 'resp_*.json" 2>NUL'
     else
-        cmd = 'ls -1 "' .. dir .. '"resp_*.json 2>/dev/null'
+        cmd = '/bin/ls -1 "' .. dir .. '"resp_*.json 2>/dev/null || /usr/bin/ls -1 "' .. dir .. '"resp_*.json 2>/dev/null'
     end
     handle = io.popen(cmd)
     if handle then
@@ -187,7 +202,26 @@ function server.start()
     local testPath = ipcDir .. ".mcp_test"
     local ok, err = writeFile(testPath, "ok")
     if not ok then
-        return false, "Cannot write to IPC directory " .. ipcDir .. ": " .. tostring(err)
+        -- Fallback 1: $HOME/.moho_mcp/ipc/
+        local home = os.getenv("HOME") or os.getenv("USERPROFILE") or ""
+        if home ~= "" then
+            ipcDir = home .. SEP .. ".moho_mcp" .. SEP .. "ipc" .. SEP
+            mkdirp(ipcDir)
+            testPath = ipcDir .. ".mcp_test"
+            ok, err = writeFile(testPath, "ok")
+        end
+
+        -- Fallback 2: System temp folder
+        if not ok then
+            local tmp = os.getenv("TEMP") or os.getenv("TMP") or os.getenv("TMPDIR") or "/tmp"
+            ipcDir = tmp .. SEP .. "moho-mcp" .. SEP
+            mkdirp(ipcDir)
+            testPath = ipcDir .. ".mcp_test"
+            ok, err = writeFile(testPath, "ok")
+            if not ok then
+                return false, "Cannot write to IPC directory " .. ipcDir .. ": " .. tostring(err)
+            end
+        end
     end
     os.remove(testPath)
 
@@ -238,17 +272,12 @@ function server.stop()
 end
 
 --- Check if the server is currently running.
--- @return boolean
 function server.isRunning()
     return isRunning
 end
 
 --- Process a single JSON-RPC request and return a response string.
--- @param requestStr string  The raw JSON-RPC request
--- @param moho  The MOHO ScriptInterface object
--- @return string  The JSON-RPC response string
 local function processRequest(requestStr, moho)
-    -- Parse the JSON-RPC request
     local request, parseErr = protocol.parseRequest(requestStr)
     if not request then
         return protocol.createError(nil, protocol.PARSE_ERROR, parseErr or "Parse error")
@@ -258,27 +287,23 @@ local function processRequest(requestStr, moho)
     local params = request.params or {}
     local id = request.id
 
-    -- Check allow-list
     if not validator.isAllowed(method) then
         return protocol.createError(id, protocol.METHOD_NOT_FOUND,
             "Method not found: " .. tostring(method))
     end
 
-    -- Validate parameters
     local valid, validErr = validator.validateParams(method, params)
     if not valid then
         return protocol.createError(id, protocol.INVALID_PARAMS,
             validErr or "Invalid parameters")
     end
 
-    -- Look up the handler
     local handler = handlers[method]
     if not handler then
         return protocol.createError(id, protocol.METHOD_NOT_FOUND,
             "No handler registered for: " .. tostring(method))
     end
 
-    -- Execute the handler with pcall for safety
     local ok, result, handlerErr = pcall(handler, moho, params)
     if not ok then
         return protocol.createError(id, protocol.INTERNAL_ERROR,
@@ -294,58 +319,31 @@ local function processRequest(requestStr, moho)
 end
 
 --- Poll for incoming request files and process them.
--- Call this from the Run or OnIdle callback.
--- Processes at most a few requests per call to avoid blocking the UI.
--- @param moho  The MOHO ScriptInterface object
 function server.poll(moho)
     if not isRunning then
         return
     end
 
-    -- Look for request files (req_*.json)
-    local reqFiles = findFilesByPrefix(ipcDir, "req_")
+    local maxProbedId = lastSeenMaxId + 20
+    local startId = math.max(1, lastSeenMaxId - 50)
 
-    -- Process at most 2 requests per poll to keep UI responsive
-    local processed = 0
-    for _, fname in ipairs(reqFiles) do
-        if processed >= 2 then
-            break
-        end
-
-        local reqPath = ipcDir .. fname
-        local content, readErr = readFile(reqPath)
-
-        if content then
-            -- Process the request (wrapped in pcall for resilience)
-            local procOk, response = pcall(processRequest, content, moho)
-            if not procOk then
-                -- processRequest itself crashed — build an error response
-                print("[MohoMCP] processRequest crashed: " .. tostring(response))
-                response = protocol.createError(nil, protocol.INTERNAL_ERROR,
-                    "Server crash: " .. tostring(response))
+    for id = startId, maxProbedId do
+        local reqPath = ipcDir .. "req_" .. id .. ".json"
+        if fileExists(reqPath) then
+            if id > lastSeenMaxId then
+                lastSeenMaxId = id
             end
 
-            -- Extract request ID from filename: req_<id>.json -> resp_<id>.json
-            local reqId = fname:match("^req_(.+)%.json$")
-            if reqId then
-                local respPath = ipcDir .. "resp_" .. reqId .. ".json"
-                writeFile(respPath, response)
-            end
-
-            -- Remove the request file
+            local reqStr, err = readFile(reqPath)
             os.remove(reqPath)
-            processed = processed + 1
+
+            if reqStr then
+                local respStr = processRequest(reqStr, moho)
+                local respPath = ipcDir .. "resp_" .. id .. ".json"
+                writeFile(respPath, respStr)
+            end
         end
     end
-end
-
---- Get server info for status display.
--- @return table  Server status info
-function server.getInfo()
-    return {
-        running = isRunning,
-        ipcDir = ipcDir,
-    }
 end
 
 return server
