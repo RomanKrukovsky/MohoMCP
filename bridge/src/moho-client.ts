@@ -1,23 +1,19 @@
 /**
  * File-based IPC client that communicates with the MOHO Lua server.
  *
- * Protocol:
- * - Bridge writes request to: <ipcDir>/req_<id>.json
- * - MOHO reads the request, processes it, writes: <ipcDir>/resp_<id>.json
- * - MOHO deletes the request file after processing
- * - Bridge reads the response file, then deletes it
- *
- * Enterprise Hardening:
+ * Security & IPC Spooling:
+ * - Default IPC directory: Private Application Support / LocalAppData folder
+ * - Strict permissions (0700), canonical path verification, symlink & junction rejection
  * - Atomic write (.tmp -> .json)
- * - Request TTL expiration and stale file cleanup
- * - Unique correlation ID and idempotency tracking
+ * - Request TTL expiration & stale file cleanup
  * - Queue depth bounds (maxQueueSize)
  * - JSON size limits (maxJsonSizeBytes)
- * - Path sandbox and symlink verification
+ * - Single-consumer client lock
  */
 
 import fs from "node:fs";
 import path from "node:path";
+import os from "node:os";
 import crypto from "node:crypto";
 import { config } from "./config.js";
 import { parseResponse } from "./protocol.js";
@@ -30,12 +26,37 @@ export class MohoClient {
   private executedRequestIds = new Set<string>();
 
   /**
-   * Validates directory safety (ensuring no symlink hijack).
+   * Validates directory safety (ensures non-symlink, owner matching).
    */
   private async validateDirectorySafety(dirPath: string): Promise<void> {
     const lstat = await fs.promises.lstat(dirPath);
     if (lstat.isSymbolicLink()) {
       throw new Error(`Security Violation: IPC directory ${dirPath} cannot be a symbolic link.`);
+    }
+
+    // Check file owner on Unix platforms
+    if (os.platform() !== "win32" && typeof process.getuid === "function") {
+      const currentUid = process.getuid();
+      if (lstat.uid !== currentUid) {
+        throw new Error(`Security Violation: IPC directory ${dirPath} is owned by UID ${lstat.uid}, expected UID ${currentUid}.`);
+      }
+    }
+  }
+
+  /**
+   * Detects legacy temp IPC directory and prints security notice if present.
+   */
+  private async detectLegacyTempDir(): Promise<void> {
+    const legacyTempDir = path.join(os.tmpdir(), "moho-mcp");
+    try {
+      if (fs.existsSync(legacyTempDir) && path.resolve(config.moho.ipcDir) !== path.resolve(legacyTempDir)) {
+        process.stderr.write(
+          `[moho-mcp] SECURITY NOTICE: Found legacy temporary IPC directory at ${legacyTempDir}. ` +
+          `Primary secure IPC directory is set to ${config.moho.ipcDir}.\n`,
+        );
+      }
+    } catch {
+      // Ignore detection errors
     }
   }
 
@@ -77,11 +98,13 @@ export class MohoClient {
 
     const { ipcDir } = config.moho;
 
-    // Ensure the IPC directory exists
+    await this.detectLegacyTempDir();
+
+    // Ensure the IPC directory exists with private permissions (mode 0700)
     try {
       await fs.promises.mkdir(ipcDir, { recursive: true, mode: 0o700 });
     } catch {
-      // directory may already exist
+      // Directory may already exist
     }
 
     await this.validateDirectorySafety(ipcDir);
@@ -105,7 +128,7 @@ export class MohoClient {
       throw err;
     }
 
-    // Single-consumer client lock
+    // Single-consumer client lock file
     const lockPath = path.join(ipcDir, "client_lock.json");
     const lockData = {
       pid: process.pid,
@@ -116,7 +139,7 @@ export class MohoClient {
     this.connected = true;
     startKeepAlive();
     process.stderr.write(
-      `[moho-mcp] Connected to MOHO via file IPC at ${ipcDir} (Protocol v${config.server.protocolVersion})\n`,
+      `[moho-mcp] Connected to MOHO via secure file IPC at ${ipcDir} (Protocol v${config.server.protocolVersion})\n`,
     );
   }
 
@@ -167,7 +190,6 @@ export class MohoClient {
       throw new Error(`Duplicate request key rejected: ${uniqueReqKey}`);
     }
     this.executedRequestIds.add(uniqueReqKey);
-    // Keep deduplication set bounded
     if (this.executedRequestIds.size > 1000) {
       const firstItem = this.executedRequestIds.values().next().value;
       if (firstItem) this.executedRequestIds.delete(firstItem);
@@ -176,7 +198,6 @@ export class MohoClient {
     const { ipcDir, pollInterval, requestTimeout, maxJsonSizeBytes } = config.moho;
     const timeout = options?.timeout ?? requestTimeout;
 
-    // Build JSON-RPC request with protocol version & correlation tracking
     const request = {
       jsonrpc: "2.0",
       protocolVersion: config.server.protocolVersion,
@@ -199,12 +220,10 @@ export class MohoClient {
 
     this.pendingRequests++;
     try {
-      // Write request file atomically (write to .tmp then rename)
       const tmpPath = reqPath + ".tmp";
       await fs.promises.writeFile(tmpPath, serializedPayload, "utf-8");
       await fs.promises.rename(tmpPath, reqPath);
 
-      // Poll for response file
       const startTime = Date.now();
 
       while (true) {

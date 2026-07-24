@@ -1,12 +1,24 @@
 import path from "node:path";
 import os from "node:os";
 
-const defaultIpcDir = process.env.MOHO_MCP_IPC_DIR ||
-  path.join(os.tmpdir(), "moho-mcp");
+function getDefaultIpcDir(): string {
+  if (process.env.MOHO_IPC_DIR) {
+    return process.env.MOHO_IPC_DIR;
+  }
+  const platform = os.platform();
+  if (platform === "darwin") {
+    return path.join(os.homedir(), "Library", "Application Support", "MohoMCP", "ipc");
+  } else if (platform === "win32") {
+    const localAppData = process.env.LOCALAPPDATA || path.join(os.homedir(), "AppData", "Local");
+    return path.join(localAppData, "MohoMCP", "ipc");
+  } else {
+    return path.join(os.homedir(), ".moho_mcp", "ipc");
+  }
+}
 
 export const config = {
   moho: {
-    ipcDir: defaultIpcDir,
+    ipcDir: getDefaultIpcDir(),
     pollInterval: 100,      // ms between checking for response files
     requestTimeout: 10000,  // ms before a request times out
     renderTimeout: 30000,   // ms timeout for render/screenshot requests
@@ -15,7 +27,10 @@ export const config = {
     maxQueueSize: 50,       // maximum pending requests in queue
     maxJsonSizeBytes: 10 * 1024 * 1024, // 10MB maximum JSON payload
     requestTtlMs: 30000,    // 30 second request TTL
-    enableUiAutomation: process.env.ENABLE_UI_AUTOMATION === "true",
+    previewTtlMs: 60000,    // 60 second TTL for previewHash confirmation
+    enableLegacyAliases: process.env.MOHO_MCP_ENABLE_LEGACY_ALIASES === "true",
+    enableScreenshots: process.env.MOHO_MCP_ENABLE_SCREENSHOTS === "true",
+    enableUiAutomation: process.env.MOHO_MCP_ENABLE_UI_AUTOMATION === "true",
   },
   server: {
     name: "moho-mcp",

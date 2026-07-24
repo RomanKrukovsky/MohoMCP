@@ -2,7 +2,8 @@
  * MCP tool definitions and handlers for the MOHO bridge.
  *
  * Primary tools map 1-to-1 to JSON-RPC methods exposed by the MOHO Lua server.
- * Hardened with MohoSafetyEngine whitelist, dry-run, path sandbox, and confirmations.
+ * Hardened with MohoSafetyEngine whitelist, previewHash cryptographic binding,
+ * path sandbox, and granular feature flags.
  */
 
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -53,6 +54,15 @@ async function ensureConnected(client: MohoClient): Promise<void> {
   }
 }
 
+function checkScreenshotPermission(): void {
+  if (!config.moho.enableScreenshots) {
+    throw new Error(
+      "SECURITY WARNING: Read-only screenshot capture is disabled by default. " +
+      "Set MOHO_MCP_ENABLE_SCREENSHOTS=true in your environment to enable document_screenshot.",
+    );
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Tool registration
 // ---------------------------------------------------------------------------
@@ -61,11 +71,11 @@ export function registerTools(server: McpServer, client: MohoClient): void {
   const executeSafeRequest = async (
     method: string,
     params: Record<string, unknown> = {},
-    options?: { timeout?: number; confirmRequired?: boolean; confirm?: boolean },
+    options?: { timeout?: number; previewHash?: string },
   ): Promise<unknown> => {
     safetyEngine.validateMethodWhitelist(method);
-    if (options?.confirmRequired || method.includes("delete") || method.includes("render")) {
-      safetyEngine.checkConfirmation(method, params, options?.confirm);
+    if (method.includes("delete")) {
+      safetyEngine.validatePreviewConfirmation(method, params, options?.previewHash);
     }
     await ensureConnected(client);
     return client.sendRequest(method, params, options);
@@ -404,19 +414,19 @@ export function registerTools(server: McpServer, client: MohoClient): void {
 
   server.tool(
     "animation_deleteKeyframe",
-    "Delete a keyframe from a channel at a frame (Destructive operation)",
+    "Delete a keyframe from a channel at a frame (Destructive operation - Requires previewHash)",
     {
       layerId: z.number().describe("Numeric ID of layer"),
       channel: z.string().describe("Channel name"),
       frame: z.number().int().min(0).describe("Target frame"),
-      confirm: z.boolean().optional().describe("Explicit confirmation boolean required for deletion"),
+      previewHash: z.string().describe("Cryptographic preview hash generated from plan preview"),
     },
-    async ({ layerId, channel, frame, confirm }: any) => {
+    async ({ layerId, channel, frame, previewHash }: any) => {
       try {
         const result = await executeSafeRequest(
           "animation.deleteKeyframe",
           { layerId, channel, frame },
-          { confirmRequired: true, confirm },
+          { previewHash },
         );
         return successContent(result);
       } catch (err) {
@@ -486,12 +496,12 @@ export function registerTools(server: McpServer, client: MohoClient): void {
   );
 
   // =========================================================================
-  // 6. Batch Operations
+  // 6. Batch Operations (Hardened with SafetyEngine)
   // =========================================================================
 
   server.tool(
     "batch_execute",
-    "Execute multiple operations sequentially within a single Lua request for high efficiency",
+    "Execute multiple operations sequentially within a single Lua request with strict nested Safety Engine validation",
     {
       operations: z.array(
         z.object({
@@ -502,9 +512,7 @@ export function registerTools(server: McpServer, client: MohoClient): void {
     },
     async ({ operations }: any) => {
       try {
-        for (const op of operations) {
-          safetyEngine.validateMethodWhitelist(op.method);
-        }
+        safetyEngine.validateBatchSafety(operations, [process.cwd(), os.tmpdir()]);
         const timeout = config.moho.requestTimeout + operations.length * config.moho.batchTimeoutPerOp;
         const result = await executeSafeRequest("batch.execute", { operations }, { timeout });
         return successContent(result);
@@ -515,17 +523,18 @@ export function registerTools(server: McpServer, client: MohoClient): void {
   );
 
   // =========================================================================
-  // 7. Level 2 UI Automation (Disabled by default)
+  // 7. Granular UI Automation Tools (Disabled by default)
   // =========================================================================
 
   server.tool(
     "document_screenshot",
-    "Capture a screenshot of the active Moho application window (Level 2 UI Automation)",
+    "Capture a screenshot of the active Moho application window (Read-only UI Permission required)",
     {
       outputPath: z.string().optional().describe("Optional destination file path for PNG screenshot"),
     },
     async ({ outputPath }: any) => {
       try {
+        checkScreenshotPermission();
         const destination = outputPath
           ? safetyEngine.validatePathSandbox(outputPath, [process.cwd(), os.tmpdir()])
           : path.join(os.tmpdir(), `moho_screenshot_${Date.now()}.png`);
@@ -536,7 +545,7 @@ export function registerTools(server: McpServer, client: MohoClient): void {
           filePath: destination,
           width: dimensions.width,
           height: dimensions.height,
-          notice: "Captured via Level 2 UI Automation.",
+          notice: "Captured via Read-Only Screenshot permission.",
         });
       } catch (err) {
         return errorContent(err);
@@ -546,7 +555,7 @@ export function registerTools(server: McpServer, client: MohoClient): void {
 
   server.tool(
     "input_mouseClick",
-    "Send a mouse click event within Moho window bounds (Level 2 UI Automation)",
+    "Send a mouse click event within Moho window bounds (Input Automation Permission required)",
     {
       x: z.number().describe("X coordinate within Moho window"),
       y: z.number().describe("Y coordinate within Moho window"),
@@ -565,7 +574,7 @@ export function registerTools(server: McpServer, client: MohoClient): void {
 
   server.tool(
     "input_mouseDrag",
-    "Send a mouse drag event within Moho window bounds (Level 2 UI Automation)",
+    "Send a mouse drag event within Moho window bounds (Input Automation Permission required)",
     {
       startX: z.number(),
       startY: z.number(),
@@ -586,7 +595,7 @@ export function registerTools(server: McpServer, client: MohoClient): void {
 
   server.tool(
     "input_sendKeys",
-    "Send simulated keystrokes to Moho application (Level 2 UI Automation)",
+    "Send simulated keystrokes to Moho application (Input Automation Permission required)",
     {
       keys: z.string().describe("Keystroke string to send"),
     },
@@ -615,6 +624,8 @@ export function registerTools(server: McpServer, client: MohoClient): void {
           scriptingApiVersion: "14.0",
           bridgeVersion: config.server.version,
           protocolVersion: config.server.protocolVersion,
+          legacyAliasesEnabled: config.moho.enableLegacyAliases,
+          screenshotsEnabled: config.moho.enableScreenshots,
           uiAutomationEnabled: config.moho.enableUiAutomation,
           supportedModules: ["document", "layer", "bone", "animation", "mesh", "batch"],
         };
@@ -639,6 +650,8 @@ export function registerTools(server: McpServer, client: MohoClient): void {
           ipcDir: config.moho.ipcDir,
           activeDocument: docInfo,
           protocolVersion: config.server.protocolVersion,
+          legacyAliasesEnabled: config.moho.enableLegacyAliases,
+          screenshotsEnabled: config.moho.enableScreenshots,
           uiAutomationEnabled: config.moho.enableUiAutomation,
         });
       } catch (err) {
@@ -653,184 +666,95 @@ export function registerTools(server: McpServer, client: MohoClient): void {
   );
 
   // =========================================================================
-  // 9. Enterprise Composite Workflows
+  // 9. Experimental Workflows (Explicitly marked unsupported_capability)
   // =========================================================================
 
   server.tool(
     "workflow_createCharacterRig",
-    "Construct a character rig plan decomposing into atomic layer and bone operations",
+    "[EXPERIMENTAL UNVERIFIED] Character rig construction workflow",
     {
-      characterName: z.string().describe("Name of the character"),
-      includeSubGroups: z.boolean().optional().default(true),
+      characterName: z.string().describe("Name of character"),
     },
-    async ({ characterName, includeSubGroups }: any) => {
-      try {
-        const correlationId = `corr_rig_${Date.now()}`;
-        const plan = safetyEngine.createExecutionPlan(correlationId, [
-          { method: "layer.selectLayer", params: { layerId: 0 }, description: "Select root" },
-          { method: "document.getInfo", params: {}, description: "Fetch document details" },
-        ]);
-        return successContent({
-          characterName,
-          executionPlan: plan,
-          status: "PLANNED",
-          notice: "Plan validated and ready for atomic execution.",
-        });
-      } catch (err) {
-        return errorContent(err);
-      }
+    async ({ characterName }: any) => {
+      return errorContent(
+        `Capability 'workflow_createCharacterRig' is currently EXPERIMENTAL and UNSUPPORTED. ` +
+        `Atomic Lua API chain for '${characterName}' is not yet verified in live Moho Pro 14. Use atomic layer/bone tools instead.`,
+      );
     },
   );
 
   server.tool(
     "workflow_setupSmartBone",
-    "Setup a smart bone control action on a specified bone",
+    "[EXPERIMENTAL UNVERIFIED] Smart bone action setup workflow",
     {
-      layerId: z.number().describe("Numeric ID of bone layer"),
-      boneId: z.number().describe("Numeric ID of bone"),
-      actionName: z.string().describe("Name of the smart bone action"),
+      layerId: z.number(),
+      boneId: z.number(),
+      actionName: z.string(),
     },
-    async ({ layerId, boneId, actionName }: any) => {
-      try {
-        const correlationId = `corr_sb_${Date.now()}`;
-        const plan = safetyEngine.createExecutionPlan(correlationId, [
-          { method: "bone.getProperties", params: { layerId, boneId }, description: "Verify target bone" },
-          { method: "bone.selectBone", params: { layerId, boneId }, description: "Select target bone" },
-        ]);
-        return successContent({
-          layerId,
-          boneId,
-          actionName,
-          executionPlan: plan,
-          status: "PLANNED",
-        });
-      } catch (err) {
-        return errorContent(err);
-      }
+    async ({ actionName }: any) => {
+      return errorContent(
+        `Capability 'workflow_setupSmartBone' is currently EXPERIMENTAL and UNSUPPORTED. ` +
+        `Action '${actionName}' cannot be verified without live Moho bone API bindings. Use atomic bone tools instead.`,
+      );
     },
   );
 
   server.tool(
     "workflow_applyLipSync",
-    "Apply phoneme timing keyframes to a switch layer",
+    "[EXPERIMENTAL UNVERIFIED] Phoneme lip-sync workflow",
     {
-      layerId: z.number().describe("Numeric ID of switch layer"),
-      phonemes: z.array(
-        z.object({
-          frame: z.number().int().min(0),
-          phoneme: z.string(),
-        }),
-      ).describe("Array of frame-to-phoneme mappings"),
+      layerId: z.number(),
+      phonemes: z.array(z.object({ frame: z.number(), phoneme: z.string() })),
     },
-    async ({ layerId, phonemes }: any) => {
-      try {
-        const operations = (phonemes || []).map((p: any) => ({
-          method: "animation.setKeyframe",
-          params: { layerId, channel: "switch", frame: p.frame, value: p.phoneme },
-        }));
-
-        const result = await executeSafeRequest("batch.execute", { operations });
-        return successContent({
-          layerId,
-          appliedPhonemeCount: (phonemes || []).length,
-          batchResult: result,
-        });
-      } catch (err) {
-        return errorContent(err);
-      }
-    },
-  );
-
-  server.tool(
-    "workflow_duplicateLayerTree",
-    "Duplicate an entire layer subtree",
-    {
-      layerId: z.number().describe("Numeric ID of layer subtree root"),
-    },
-    async ({ layerId }: any) => {
-      try {
-        const layerProps = await executeSafeRequest("layer.getProperties", { layerId });
-        return successContent({
-          sourceLayerId: layerId,
-          sourceProperties: layerProps,
-          status: "ANALYZED",
-          message: "Layer tree analyzed for safe duplication.",
-        });
-      } catch (err) {
-        return errorContent(err);
-      }
-    },
-  );
-
-  server.tool(
-    "workflow_batchRender",
-    "Render animation range to output video or image sequence (Destructive / Resource Heavy)",
-    {
-      startFrame: z.number().int().min(0),
-      endFrame: z.number().int().min(0),
-      outputPath: z.string(),
-      confirm: z.boolean().optional().describe("Explicit confirmation boolean required"),
-    },
-    async ({ startFrame, endFrame, outputPath, confirm }: any) => {
-      try {
-        const destination = safetyEngine.validatePathSandbox(outputPath, [process.cwd(), os.tmpdir()]);
-        safetyEngine.checkConfirmation("workflow_batchRender", { startFrame, endFrame, destination }, confirm);
-        return successContent({
-          startFrame,
-          endFrame,
-          outputPath: destination,
-          status: "QUEUED",
-        });
-      } catch (err) {
-        return errorContent(err);
-      }
+    async () => {
+      return errorContent(
+        `Capability 'workflow_applyLipSync' is currently EXPERIMENTAL and UNSUPPORTED. ` +
+        `Use atomic animation.setKeyframe tools within a batch.execute payload.`,
+      );
     },
   );
 
   // =========================================================================
-  // 10. Backward Compatibility Legacy Tool Aliases
+  // 10. Conditional Legacy Aliases (Default OFF: MOHO_MCP_ENABLE_LEGACY_ALIASES=false)
   // =========================================================================
 
-  const aliasMap: Array<{ alias: string; primary: string }> = [
-    { alias: "moho_doc_info", primary: "document_getInfo" },
-    { alias: "moho_list_layers", primary: "document_getLayers" },
-    { alias: "moho_layer_props", primary: "layer_getProperties" },
-    { alias: "moho_layer_bones", primary: "layer_getBones" },
-    { alias: "moho_bone_props", primary: "bone_getProperties" },
-    { alias: "moho_set_bone_transform", primary: "bone_setTransform" },
-    { alias: "moho_set_layer_transform", primary: "layer_setTransform" },
-    { alias: "moho_set_keyframe", primary: "animation_setKeyframe" },
-    { alias: "moho_set_frame", primary: "document_setFrame" },
-    { alias: "moho_batch_execute", primary: "batch_execute" },
-    { alias: "moho_duplicate_layer_tree", primary: "workflow_duplicateLayerTree" },
-    { alias: "moho_batch_render", primary: "workflow_batchRender" },
-    { alias: "moho_create_character_rig", primary: "workflow_createCharacterRig" },
-    { alias: "moho_setup_smart_bone", primary: "workflow_setupSmartBone" },
-    { alias: "moho_apply_lipsync", primary: "workflow_applyLipSync" },
-    { alias: "moho_diagnose_system", primary: "system_diagnose" },
-    { alias: "moho_get_capabilities", primary: "system_getCapabilities" },
-  ];
+  if (config.moho.enableLegacyAliases) {
+    const aliasMap: Array<{ alias: string; primary: string }> = [
+      { alias: "moho_doc_info", primary: "document_getInfo" },
+      { alias: "moho_list_layers", primary: "document_getLayers" },
+      { alias: "moho_layer_props", primary: "layer_getProperties" },
+      { alias: "moho_layer_bones", primary: "layer_getBones" },
+      { alias: "moho_bone_props", primary: "bone_getProperties" },
+      { alias: "moho_set_bone_transform", primary: "bone_setTransform" },
+      { alias: "moho_set_layer_transform", primary: "layer_setTransform" },
+      { alias: "moho_set_keyframe", primary: "animation_setKeyframe" },
+      { alias: "moho_set_frame", primary: "document_setFrame" },
+      { alias: "moho_batch_execute", primary: "batch_execute" },
+      { alias: "moho_diagnose_system", primary: "system_diagnose" },
+      { alias: "moho_get_capabilities", primary: "system_getCapabilities" },
+    ];
 
-  for (const { alias, primary } of aliasMap) {
-    server.tool(
-      alias,
-      `[DEPRECATED ALIAS] Use '${primary}' instead.`,
-      {
-        params: z.record(z.unknown()).optional().describe("Forwarded parameters"),
-      },
-      async (args: any) => {
-        try {
-          const payload = args?.params || {};
-          const result = await executeSafeRequest(primary.replace("_", "."), payload);
-          return successContent({
-            deprecatedAlias: alias,
-            useInstead: primary,
-            result,
-          });
-        } catch (err) {
-          return errorContent(err);
-        }
-      },
-    );
+    for (const { alias, primary } of aliasMap) {
+      server.tool(
+        alias,
+        `[DEPRECATED LEGACY ALIAS] Use '${primary}' instead. Enabled via MOHO_MCP_ENABLE_LEGACY_ALIASES=true.`,
+        {
+          params: z.record(z.unknown()).optional().describe("Forwarded parameters"),
+        },
+        async (args: any) => {
+          try {
+            const payload = args?.params || {};
+            const result = await executeSafeRequest(primary.replace("_", "."), payload);
+            return successContent({
+              deprecatedAlias: alias,
+              useInstead: primary,
+              result,
+            });
+          } catch (err) {
+            return errorContent(err);
+          }
+        },
+      );
+    }
   }
 }

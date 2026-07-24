@@ -1,6 +1,7 @@
 import path from "node:path";
 import fs from "node:fs/promises";
 import crypto from "node:crypto";
+import { config } from "../config.js";
 
 export interface PlanStep {
   stepNumber: number;
@@ -13,6 +14,9 @@ export interface PlanStep {
 export interface ExecutionPlan {
   planId: string;
   correlationId: string;
+  projectRevision: string;
+  previewHash: string;
+  expiresAt: number;
   steps: PlanStep[];
   requiresConfirmation: boolean;
   summary: string;
@@ -92,21 +96,9 @@ export class MohoSafetyEngine {
     "mesh.getShapes",
     "mesh_getPoints",
     "mesh_getShapes",
-    // Batch & Workflows
+    // Batch
     "batch.execute",
     "batch_execute",
-    "workflow_createCharacterRig",
-    "workflow_setupSmartBone",
-    "workflow_applyLipSync",
-    "workflow_duplicateLayerTree",
-    "workflow_batchRender",
-    // UI Automation (Level 2)
-    "input.mouseClick",
-    "input.mouseDrag",
-    "input.sendKeys",
-    "input_mouseClick",
-    "input_mouseDrag",
-    "input_sendKeys",
     // Diagnostics & Capabilities
     "system.getCapabilities",
     "system_getCapabilities",
@@ -116,9 +108,9 @@ export class MohoSafetyEngine {
   private readonly destructiveMethods: Set<string> = new Set([
     "animation.deleteKeyframe",
     "animation_deleteKeyframe",
-    "workflow_batchRender",
   ]);
 
+  private activePlans: Map<string, ExecutionPlan> = new Map();
   private transactions: Map<string, TransactionRecord> = new Map();
 
   public validateMethodWhitelist(method: string): void {
@@ -129,8 +121,12 @@ export class MohoSafetyEngine {
     }
   }
 
+  /**
+   * Generates a plan with cryptographic previewHash and 60-second TTL.
+   */
   public createExecutionPlan(
     correlationId: string,
+    projectRevision: string,
     steps: Array<{ method: string; params: Record<string, unknown>; description: string }>,
   ): ExecutionPlan {
     const planSteps: PlanStep[] = steps.map((s, idx) => {
@@ -147,56 +143,78 @@ export class MohoSafetyEngine {
 
     const requiresConfirmation = planSteps.some((st) => st.isDestructive);
     const planId = `plan_${crypto.randomBytes(4).toString("hex")}`;
+    const expiresAt = Date.now() + config.moho.previewTtlMs;
 
-    return {
+    const hashPayload = JSON.stringify({ planId, correlationId, projectRevision, steps: planSteps, expiresAt });
+    const previewHash = crypto.createHash("sha256").update(hashPayload).digest("hex").substring(0, 16);
+
+    const plan: ExecutionPlan = {
       planId,
       correlationId,
+      projectRevision,
+      previewHash,
+      expiresAt,
       steps: planSteps,
       requiresConfirmation,
       summary: `Planned ${planSteps.length} operations. ${
-        requiresConfirmation ? "Requires explicit confirmation." : "Safe to auto-execute."
+        requiresConfirmation ? "Requires explicit confirmation via previewHash." : "Safe to auto-execute."
       }`,
     };
+
+    this.activePlans.set(previewHash, plan);
+    return plan;
   }
 
-  public checkConfirmation(method: string, params: Record<string, unknown>, confirmed?: boolean): void {
+  /**
+   * Validates previewHash confirmation for destructive operations.
+   */
+  public validatePreviewConfirmation(
+    method: string,
+    params: Record<string, unknown>,
+    previewHash?: string,
+  ): void {
     const isDestructive = this.destructiveMethods.has(method);
-    if (isDestructive && !confirmed) {
+    if (!isDestructive) return;
+
+    if (!previewHash) {
       throw new MohoValidationError(
-        `Method '${method}' is a destructive operation. You must pass 'confirm: true' to proceed.`,
+        `Destructive operation '${method}' requires a valid 'previewHash' generated from a prior plan preview. Passing 'confirm: true' alone is prohibited.`,
+      );
+    }
+
+    const cachedPlan = this.activePlans.get(previewHash);
+    if (!cachedPlan) {
+      throw new MohoValidationError(
+        `Invalid or unknown previewHash '${previewHash}'. Generate a fresh execution plan preview first.`,
+      );
+    }
+
+    if (Date.now() > cachedPlan.expiresAt) {
+      this.activePlans.delete(previewHash);
+      throw new MohoValidationError(
+        `Expired previewHash '${previewHash}'. Previews are valid for 60 seconds. Generate a fresh plan.`,
       );
     }
   }
 
-  public async beginTransaction(
-    correlationId: string,
-    method: string,
-    params: Record<string, unknown>,
-  ): Promise<string> {
-    const transactionId = `tx_${crypto.randomBytes(4).toString("hex")}`;
-    const record: TransactionRecord = {
-      transactionId,
-      correlationId,
-      timestamp: Date.now(),
-      method,
-      params,
-      status: "PENDING",
-    };
-    this.transactions.set(transactionId, record);
-    return transactionId;
-  }
-
-  public commitTransaction(transactionId: string): void {
-    const tx = this.transactions.get(transactionId);
-    if (tx) {
-      tx.status = "COMMITTED";
+  /**
+   * Safety validation for nested batch_execute operations.
+   */
+  public validateBatchSafety(
+    operations: Array<{ method: string; params: Record<string, unknown> }>,
+    allowedDirs: string[],
+  ): void {
+    if (operations.length > config.moho.maxBatchSize) {
+      throw new MohoValidationError(
+        `Batch operation limit exceeded: ${operations.length} ops requested (max allowed: ${config.moho.maxBatchSize}).`,
+      );
     }
-  }
 
-  public rollbackTransaction(transactionId: string): void {
-    const tx = this.transactions.get(transactionId);
-    if (tx) {
-      tx.status = "ROLLED_BACK";
+    for (const op of operations) {
+      this.validateMethodWhitelist(op.method);
+      if (op.params.outputPath && typeof op.params.outputPath === "string") {
+        this.validatePathSandbox(op.params.outputPath, allowedDirs);
+      }
     }
   }
 
@@ -209,7 +227,7 @@ export class MohoSafetyEngine {
 
     if (!isAllowed) {
       throw new MohoSecurityError(
-        `Access denied: Path '${targetPath}' is outside the authorized sandbox directories.`,
+        `Access denied: Path '${targetPath}' is outside authorized sandbox directories (${allowedDirs.join(", ")}).`,
       );
     }
 
