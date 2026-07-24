@@ -17,6 +17,7 @@ local deadLetterDir = ""
 local lastProcessedSeq = 0  -- Persistent cursor: highest sequence number processed
 local processedSequences = {}  -- Deduplication set for processed request sequences
 local lastHealthWrite = 0
+local persistenceFile = ""  -- Path to cursor persistence file
 
 -- Tool handler registry: method name -> function(moho, params) -> result, err
 local handlers = {}
@@ -24,17 +25,14 @@ local handlers = {}
 -- Platform detection
 local SEP = package.config:sub(1, 1) -- "/" on unix, "\" on windows
 
--- Try to load LuaFileSystem for file attribute access
-local lfs = nil
-pcall(function() lfs = require("lfs") end)
-
 -- Configuration constants
 local MAX_JSON_SIZE = 1024 * 1024       -- 1MB max request size
 local REQUEST_TTL_MS = 30000            -- 30 second TTL for requests
 local MAX_DEAD_LETTERS = 100            -- Max files in dead-letter directory
 local HEALTH_WRITE_INTERVAL_MS = 5000   -- Health file update interval
+local PERSIST_INTERVAL = 100            -- Persist cursor every N requests
 
---- Initialize the server module with its dependencies.
+-- Initialize the server module with its dependencies.
 -- @param deps table  Dependencies: { protocol, validator, json }
 function server.init(deps)
     protocol = deps.protocol
@@ -42,14 +40,14 @@ function server.init(deps)
     json = deps.json
 end
 
---- Register a tool handler for a given method name.
+-- Register a tool handler for a given method name.
 -- @param method string  The JSON-RPC method name
 -- @param handler function  Handler function(moho, params) -> result, err
 function server.registerHandler(method, handler)
     handlers[method] = handler
 end
 
---- Look up a registered handler by method name.
+-- Look up a registered handler by method name.
 -- Used by the batch handler to dispatch operations without going through processRequest().
 -- @param method string  The JSON-RPC method name
 -- @return function|nil  The handler function, or nil if not registered
@@ -57,7 +55,7 @@ function server.getHandler(method)
     return handlers[method]
 end
 
---- Get the primary IPC directory path.
+-- Get the primary IPC directory path.
 -- Uses Application Support / LocalAppData primary folder. Overridden by MOHO_IPC_DIR.
 local function getIpcDir()
     local override = os.getenv("MOHO_IPC_DIR") or os.getenv("MOHO_MCP_IPC_DIR")
@@ -86,7 +84,7 @@ local function getIpcDir()
     return tmp .. SEP .. "moho-mcp" .. SEP
 end
 
---- Ensure directory exists (uses platform commands to bypass PATH restrictions).
+-- Ensure directory exists (uses platform commands to bypass PATH restrictions).
 local function mkdirp(dirPath)
     local cleanPath = dirPath:gsub("[/\\]+$", "")
     local cmd
@@ -99,9 +97,19 @@ local function mkdirp(dirPath)
     if handle then handle:close() end
 end
 
---- List all files in a directory using platform-appropriate command.
+-- Validate path for safe shell usage: only alphanumeric, underscore, dash, dot, slash, backslash.
+-- Prevents command injection via shell metacharacters.
+local function isSafePath(path)
+    return path:match("^[%w%_%-%./\\]+$") ~= nil
+end
+
+-- List all files in a directory using platform-appropriate command.
 -- Returns array of filenames (without directory prefix).
+-- Validates path safety before execution.
 local function listDir(dirPath)
+    if not isSafePath(dirPath) then
+        return {}
+    end
     local files = {}
     local cmd
     if SEP == "\\" then
@@ -119,7 +127,7 @@ local function listDir(dirPath)
     return files
 end
 
---- Parse sequence number from request/response filename.
+-- Parse sequence number from request/response filename.
 -- Expected format: req_<seq>.json or resp_<seq>.json
 -- @return number|nil sequence number, or nil if not parseable
 local function parseSeqFromFilename(fname)
@@ -130,34 +138,7 @@ local function parseSeqFromFilename(fname)
     return nil
 end
 
---- Get file modification time (cross-platform, no lfs dependency).
--- @return number|nil modification time in seconds since epoch, or nil if unavailable
-local function getFileModTime(path)
-    -- Try LuaFileSystem first
-    if lfs and lfs.attributes then
-        local attr = lfs.attributes(path)
-        if attr and attr.modification then
-            return attr.modification
-        end
-    end
-    -- Fallback: use platform command
-    local cmd
-    if SEP == "\\" then
-        cmd = 'cmd.exe /c for %I in ("' .. path .. '") do @echo %~tI 2>NUL'
-    else
-        cmd = 'stat -c %Y "' .. path .. '" 2>/dev/null'
-    end
-    local handle = io.popen(cmd)
-    if handle then
-        local result = handle:read("*a")
-        handle:close()
-        local mtime = tonumber(result:match("(%d+)"))
-        if mtime then return mtime end
-    end
-    return nil
-end
-
---- Check if a file exists by trying to open it.
+-- Check if a file exists by trying to open it.
 local function fileExists(path)
     local f = io.open(path, "r")
     if f then
@@ -167,7 +148,7 @@ local function fileExists(path)
     return false
 end
 
---- Read the entire contents of a file.
+-- Read the entire contents of a file.
 local function readFile(path)
     local f, err = io.open(path, "r")
     if not f then
@@ -178,7 +159,7 @@ local function readFile(path)
     return content
 end
 
---- Write content to a file atomically (write to .tmp then rename).
+-- Write content to a file atomically (write to .tmp then rename).
 local function writeFile(path, content)
     local tmpPath = path .. ".tmp"
     local f, err = io.open(tmpPath, "w")
@@ -196,7 +177,35 @@ local function writeFile(path, content)
     return true
 end
 
---- Write health.json atomically with current server status.
+-- Persist cursor and processed sequences to disk for crash recovery.
+local function persistState()
+    if persistenceFile == "" then return end
+    local data = {
+        lastProcessedSeq = lastProcessedSeq,
+        processedSequences = processedSequences,
+        savedAt = os.date("!%Y-%m-%dT%H:%M:%SZ"),
+    }
+    local content = json.encode(data)
+    writeFile(persistenceFile, content)
+end
+
+-- Load persisted cursor and processed sequences from disk.
+local function loadState()
+    if persistenceFile == "" then return end
+    if not fileExists(persistenceFile) then return end
+    local content, err = readFile(persistenceFile)
+    if not content then return end
+    local ok, data = pcall(json.decode, content)
+    if not ok or type(data) ~= "table" then return end
+    if data.lastProcessedSeq and type(data.lastProcessedSeq) == "number" then
+        lastProcessedSeq = data.lastProcessedSeq
+    end
+    if data.processedSequences and type(data.processedSequences) == "table" then
+        processedSequences = data.processedSequences
+    end
+end
+
+-- Write health.json atomically with current server status.
 local function writeHealthFile()
     local healthPath = ipcDir .. "health.json"
     local healthData = {
@@ -214,7 +223,7 @@ local function writeHealthFile()
     writeFile(healthPath, content)
 end
 
---- Move a file to the dead-letter directory with metadata.
+-- Move a file to the dead-letter directory with metadata sidecar.
 local function quarantineFile(srcPath, fname, reason)
     mkdirp(deadLetterDir)
     local timestamp = os.date("!%Y%m%d_%H%M%S")
@@ -230,8 +239,8 @@ local function quarantineFile(srcPath, fname, reason)
         reason = reason,
         fileSize = 0,
     }
-    if fileExists(srcPath) then
-        local f = io.open(srcPath, "r")
+    if fileExists(destPath) then
+        local f = io.open(destPath, "r")
         if f then
             f:seek("end")
             meta.fileSize = f:seek("end")
@@ -259,12 +268,11 @@ local function quarantineFile(srcPath, fname, reason)
     end
 end
 
---- Clean up processed request/response files older than TTL.
+-- Clean up processed request/response files older than TTL.
 local function cleanupStaleFiles()
     local now = os.clock() * 1000
     local ttlMs = REQUEST_TTL_MS
 
-    -- Clean request files
     local files = listDir(ipcDir)
     for _, fname in ipairs(files) do
         local path = ipcDir .. fname
@@ -279,7 +287,7 @@ local function cleanupStaleFiles()
                 os.remove(ipcDir .. "req_" .. seq .. ".json")
                 os.remove(ipcDir .. "resp_" .. seq .. ".json")
             else
-                -- Check TTL using file modification time
+                -- Check TTL using file modification time (platform-specific)
                 local mtime = getFileModTime(path)
                 if mtime then
                     local fileAgeMs = (os.time() - mtime) * 1000
@@ -293,7 +301,67 @@ local function cleanupStaleFiles()
     end
 end
 
---- Start the file-based IPC server.
+-- Get file modification time (cross-platform, no lfs dependency).
+-- @return number|nil modification time as Unix timestamp, or nil if unavailable
+local function getFileModTime(path)
+    -- Try platform-specific stat command
+    local cmd
+    if SEP == "\\" then
+        cmd = 'cmd.exe /c for %I in ("' .. path .. '") do @echo %~tI 2>NUL'
+    else
+        cmd = 'stat -f "%m" "' .. path .. '" 2>/dev/null || stat -c "%Y" "' .. path .. '" 2>/dev/null'
+    end
+    local handle = io.popen(cmd)
+    if handle then
+        local result = handle:read("*a")
+        handle:close()
+        result = result:match("^%s*(.-)%s*$")
+        local ts = tonumber(result)
+        if ts then return ts end
+    end
+    return nil
+end
+
+-- Check if a file exists by trying to open it.
+local function fileExists(path)
+    local f = io.open(path, "r")
+    if f then
+        f:close()
+        return true
+    end
+    return false
+end
+
+-- Read the entire contents of a file.
+local function readFile(path)
+    local f, err = io.open(path, "r")
+    if not f then
+        return nil, err
+    end
+    local content = f:read("*a")
+    f:close()
+    return content
+end
+
+-- Write content to a file atomically (write to .tmp then rename).
+local function writeFile(path, content)
+    local tmpPath = path .. ".tmp"
+    local f, err = io.open(tmpPath, "w")
+    if not f then
+        return false, "Failed to open " .. tmpPath .. ": " .. tostring(err)
+    end
+    f:write(content)
+    f:close()
+    -- Rename .tmp to final path (atomic on most filesystems)
+    os.remove(path)
+    local ok, renameErr = os.rename(tmpPath, path)
+    if not ok then
+        return false, "Failed to rename: " .. tostring(renameErr)
+    end
+    return true
+end
+
+-- Start the file-based IPC server.
 -- @return boolean  true if started successfully
 -- @return string|nil  Error message on failure
 function server.start()
@@ -303,8 +371,12 @@ function server.start()
 
     ipcDir = getIpcDir()
     deadLetterDir = ipcDir .. "dead_letter" .. SEP
+    persistenceFile = ipcDir .. "cursor.json"
     mkdirp(ipcDir)
     mkdirp(deadLetterDir)
+
+    -- Load persisted state
+    loadState()
 
     -- Verify directory is accessible
     local testPath = ipcDir .. ".mcp_test"
@@ -315,6 +387,7 @@ function server.start()
         if home ~= "" then
             ipcDir = home .. SEP .. ".moho_mcp" .. SEP .. "ipc" .. SEP
             deadLetterDir = ipcDir .. "dead_letter" .. SEP
+            persistenceFile = ipcDir .. "cursor.json"
             mkdirp(ipcDir)
             mkdirp(deadLetterDir)
             testPath = ipcDir .. ".mcp_test"
@@ -326,6 +399,7 @@ function server.start()
             local tmp = os.getenv("TEMP") or os.getenv("TMP") or os.getenv("TMPDIR") or "/tmp"
             ipcDir = tmp .. SEP .. "moho-mcp" .. SEP
             deadLetterDir = ipcDir .. "dead_letter" .. SEP
+            persistenceFile = ipcDir .. "cursor.json"
             mkdirp(ipcDir)
             mkdirp(deadLetterDir)
             testPath = ipcDir .. ".mcp_test"
@@ -353,11 +427,14 @@ function server.start()
     return true
 end
 
---- Stop the IPC server.
+-- Stop the IPC server.
 function server.stop()
     if not isRunning then
         return
     end
+
+    -- Persist final state
+    persistState()
 
     -- Remove status and health files
     os.remove(ipcDir .. "status.json")
@@ -375,17 +452,17 @@ function server.stop()
     print("[MohoMCP] Server stopped")
 end
 
---- Check if the server is currently running.
+-- Check if the server is currently running.
 function server.isRunning()
     return isRunning
 end
 
---- Get the current IPC directory path (for diagnostics).
+-- Get the current IPC directory path (for diagnostics).
 function server.getIpcDir()
     return ipcDir
 end
 
---- Get server info for diagnostics.
+-- Get server info for diagnostics.
 function server.getInfo()
     return {
         running = isRunning,
@@ -397,7 +474,7 @@ function server.getInfo()
     }
 end
 
---- Process a single JSON-RPC request and return a response string.
+-- Process a single JSON-RPC request and return a response string.
 local function processRequest(requestStr, moho)
     local request, parseErr = protocol.parseRequest(requestStr)
     if not request then
@@ -439,7 +516,7 @@ local function processRequest(requestStr, moho)
     return protocol.createResponse(id, result)
 end
 
---- Poll for incoming request files and process them.
+-- Poll for incoming request files and process them.
 -- Uses directory listing + cursor instead of linear ID scanning.
 function server.poll(moho)
     if not isRunning then
@@ -471,6 +548,7 @@ function server.poll(moho)
     table.sort(requestFiles, function(a, b) return a.seq < b.seq end)
 
     -- Process each request in order
+    local processedThisPoll = 0
     for _, rf in ipairs(requestFiles) do
         local seq = rf.seq
         local fname = rf.fname
@@ -504,6 +582,12 @@ function server.poll(moho)
         -- Mark as processed
         processedSequences[seq] = true
         lastProcessedSeq = math.max(lastProcessedSeq, seq)
+        processedThisPoll = processedThisPoll + 1
+
+        -- Persist state periodically
+        if processedThisPoll % PERSIST_INTERVAL == 0 then
+            persistState()
+        end
 
         -- Limit deduplication set size
         local count = 0
