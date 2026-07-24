@@ -9,23 +9,17 @@
   },
   "scripts": {
     "build": "tsc",
+    "watch": "tsc --watch",
     "start": "node dist/index.js",
-    "dev": "tsc --watch",
-    "test": "vitest run",
-    "test:watch": "vitest",
-    "sbom": "node -e \"console.log(JSON.stringify(require('./package.json'), null, 2))\" > sbom.json"
+    "test": "vitest run"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "1.5.0",
+    "@modelcontextprotocol/sdk": "1.29.0",
     "zod": "3.24.1"
   },
   "devDependencies": {
-    "@types/node": "22.10.1",
-    "typescript": "5.7.2",
+    "@types/node": "22.10.10",
+    "typescript": "5.7.3",
     "vitest": "2.1.8"
-  },
-  "license": "MIT",
-  "engines": {
-    "node": ">=18.0.0"
   }
 }
