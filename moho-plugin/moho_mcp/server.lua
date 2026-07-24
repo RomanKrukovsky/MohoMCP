@@ -8,11 +8,15 @@ local server = {}
 -- Dependencies (set by init)
 local protocol = nil
 local validator = nil
+local json = nil
 
 -- Server state
 local isRunning = false
 local ipcDir = ""
-local lastSeenMaxId = 0
+local deadLetterDir = ""
+local lastProcessedSeq = 0  -- Persistent cursor: highest sequence number processed
+local processedSequences = {}  -- Deduplication set for processed request sequences
+local lastHealthWrite = 0
 
 -- Tool handler registry: method name -> function(moho, params) -> result, err
 local handlers = {}
@@ -20,11 +24,22 @@ local handlers = {}
 -- Platform detection
 local SEP = package.config:sub(1, 1) -- "/" on unix, "\" on windows
 
+-- Try to load LuaFileSystem for file attribute access
+local lfs = nil
+pcall(function() lfs = require("lfs") end)
+
+-- Configuration constants
+local MAX_JSON_SIZE = 1024 * 1024       -- 1MB max request size
+local REQUEST_TTL_MS = 30000            -- 30 second TTL for requests
+local MAX_DEAD_LETTERS = 100            -- Max files in dead-letter directory
+local HEALTH_WRITE_INTERVAL_MS = 5000   -- Health file update interval
+
 --- Initialize the server module with its dependencies.
 -- @param deps table  Dependencies: { protocol, validator, json }
 function server.init(deps)
     protocol = deps.protocol
     validator = deps.validator
+    json = deps.json
 end
 
 --- Register a tool handler for a given method name.
@@ -71,6 +86,77 @@ local function getIpcDir()
     return tmp .. SEP .. "moho-mcp" .. SEP
 end
 
+--- Ensure directory exists (uses platform commands to bypass PATH restrictions).
+local function mkdirp(dirPath)
+    local cleanPath = dirPath:gsub("[/\\]+$", "")
+    local cmd
+    if SEP == "\\" then
+        cmd = 'cmd.exe /c mkdir "' .. cleanPath .. '" 2>NUL'
+    else
+        cmd = '/bin/mkdir -p "' .. cleanPath .. '" 2>/dev/null'
+    end
+    local handle = io.popen(cmd)
+    if handle then handle:close() end
+end
+
+--- List all files in a directory using platform-appropriate command.
+-- Returns array of filenames (without directory prefix).
+local function listDir(dirPath)
+    local files = {}
+    local cmd
+    if SEP == "\\" then
+        cmd = 'cmd.exe /c dir /b "' .. dirPath .. '" 2>NUL'
+    else
+        cmd = '/bin/ls -1 "' .. dirPath .. '" 2>/dev/null'
+    end
+    local handle = io.popen(cmd)
+    if handle then
+        for line in handle:lines() do
+            files[#files + 1] = line
+        end
+        handle:close()
+    end
+    return files
+end
+
+--- Parse sequence number from request/response filename.
+-- Expected format: req_<seq>.json or resp_<seq>.json
+-- @return number|nil sequence number, or nil if not parseable
+local function parseSeqFromFilename(fname)
+    local seq = fname:match("^req_(%d+)%.json$") or fname:match("^resp_(%d+)%.json$")
+    if seq then
+        return tonumber(seq)
+    end
+    return nil
+end
+
+--- Get file modification time (cross-platform, no lfs dependency).
+-- @return number|nil modification time in seconds since epoch, or nil if unavailable
+local function getFileModTime(path)
+    -- Try LuaFileSystem first
+    if lfs and lfs.attributes then
+        local attr = lfs.attributes(path)
+        if attr and attr.modification then
+            return attr.modification
+        end
+    end
+    -- Fallback: use platform command
+    local cmd
+    if SEP == "\\" then
+        cmd = 'cmd.exe /c for %I in ("' .. path .. '") do @echo %~tI 2>NUL'
+    else
+        cmd = 'stat -c %Y "' .. path .. '" 2>/dev/null'
+    end
+    local handle = io.popen(cmd)
+    if handle then
+        local result = handle:read("*a")
+        handle:close()
+        local mtime = tonumber(result:match("(%d+)"))
+        if mtime then return mtime end
+    end
+    return nil
+end
+
 --- Check if a file exists by trying to open it.
 local function fileExists(path)
     local f = io.open(path, "r")
@@ -110,81 +196,101 @@ local function writeFile(path, content)
     return true
 end
 
---- Create a directory safely using absolute binary paths to bypass macOS PATH restrictions.
-local function mkdirp(dirPath)
-    local cleanPath = dirPath:gsub("[/\\]+$", "")
-    local cmd
-    if SEP == "\\" then
-        cmd = 'cmd.exe /c mkdir "' .. cleanPath .. '" 2>NUL'
-    else
-        cmd = '/bin/mkdir -p "' .. cleanPath .. '" 2>/dev/null || /usr/bin/mkdir -p "' .. cleanPath .. '" 2>/dev/null'
-    end
-    local handle = io.popen(cmd)
-    if handle then handle:close() end
+--- Write health.json atomically with current server status.
+local function writeHealthFile()
+    local healthPath = ipcDir .. "health.json"
+    local healthData = {
+        running = isRunning,
+        pid = "moho",
+        version = "0.1.0",
+        protocolVersion = "1",
+        lastPollTimestamp = os.date("!%Y-%m-%dT%H:%M:%SZ"),
+        lastProcessedSequence = lastProcessedSeq,
+        queueDepth = 0, -- Computed by bridge
+        errorCount = 0,
+        uptimeSeconds = math.floor(os.clock()),
+    }
+    local content = json.encode(healthData)
+    writeFile(healthPath, content)
 end
 
---- Find request/response files by probing for known ID patterns.
-local function findFilesByPrefix(dir, prefix)
-    local files = {}
-    local misses = 0
-    for id = 1, 10000 do
-        local fname = prefix .. id .. ".json"
-        local f = io.open(dir .. fname, "r")
+--- Move a file to the dead-letter directory with metadata.
+local function quarantineFile(srcPath, fname, reason)
+    mkdirp(deadLetterDir)
+    local timestamp = os.date("!%Y%m%d_%H%M%S")
+    local destName = timestamp .. "_" .. fname
+    local destPath = deadLetterDir .. destName
+    os.rename(srcPath, destPath)
+
+    -- Write metadata sidecar
+    local metaPath = destPath .. ".meta"
+    local meta = {
+        originalName = fname,
+        quarantinedAt = os.date("!%Y-%m-%dT%H:%M:%SZ"),
+        reason = reason,
+        fileSize = 0,
+    }
+    if fileExists(srcPath) then
+        local f = io.open(srcPath, "r")
         if f then
+            f:seek("end")
+            meta.fileSize = f:seek("end")
             f:close()
-            files[#files + 1] = fname
-            misses = 0
-        else
-            misses = misses + 1
-            if misses > 10 then
-                break
-            end
         end
     end
-    return files
+    writeFile(metaPath, json.encode(meta))
+
+    -- Enforce max dead letters
+    local files = listDir(deadLetterDir)
+    local metaFiles = {}
+    for _, f in ipairs(files) do
+        if f:match("%.meta$") then
+            metaFiles[#metaFiles + 1] = f
+        end
+    end
+    if #metaFiles > MAX_DEAD_LETTERS then
+        table.sort(metaFiles)
+        for i = 1, #metaFiles - MAX_DEAD_LETTERS do
+            local oldMeta = metaFiles[i]
+            local base = oldMeta:gsub("%.meta$", "")
+            os.remove(deadLetterDir .. oldMeta)
+            os.remove(deadLetterDir .. base)
+        end
+    end
 end
 
---- One-time scan to discover the current bridge ID range.
-local function discoverCurrentIdRange(dir)
-    local cmd
-    if SEP == "\\" then
-        cmd = 'cmd.exe /c dir /b "' .. dir .. 'req_*.json" 2>NUL'
-    else
-        cmd = '/bin/ls -1 "' .. dir .. '"req_*.json 2>/dev/null || /usr/bin/ls -1 "' .. dir .. '"req_*.json 2>/dev/null'
-    end
-    local handle = io.popen(cmd)
-    if handle then
-        for line in handle:lines() do
-            local id = line:match("req_(%d+)%.json")
-            if id then
-                local numId = tonumber(id)
-                if numId and numId > lastSeenMaxId then
-                    lastSeenMaxId = numId
-                end
-            end
-        end
-        handle:close()
-    end
+--- Clean up processed request/response files older than TTL.
+local function cleanupStaleFiles()
+    local now = os.clock() * 1000
+    local ttlMs = REQUEST_TTL_MS
 
-    if SEP == "\\" then
-        cmd = 'cmd.exe /c dir /b "' .. dir .. 'resp_*.json" 2>NUL'
-    else
-        cmd = '/bin/ls -1 "' .. dir .. '"resp_*.json 2>/dev/null || /usr/bin/ls -1 "' .. dir .. '"resp_*.json 2>/dev/null'
-    end
-    handle = io.popen(cmd)
-    if handle then
-        for line in handle:lines() do
-            local id = line:match("resp_(%d+)%.json")
-            if id then
-                local numId = tonumber(id)
-                if numId and numId > lastSeenMaxId then
-                    lastSeenMaxId = numId
+    -- Clean request files
+    local files = listDir(ipcDir)
+    for _, fname in ipairs(files) do
+        local path = ipcDir .. fname
+        local seq = parseSeqFromFilename(fname)
+        local isRequest = fname:match("^req_") ~= nil
+        local isResponse = fname:match("^resp_") ~= nil
+
+        if (isRequest or isResponse) and seq then
+            -- Check if we've already processed this sequence
+            if processedSequences[seq] then
+                -- Already processed - remove both req and resp if they exist
+                os.remove(ipcDir .. "req_" .. seq .. ".json")
+                os.remove(ipcDir .. "resp_" .. seq .. ".json")
+            else
+                -- Check TTL using file modification time
+                local mtime = getFileModTime(path)
+                if mtime then
+                    local fileAgeMs = (os.time() - mtime) * 1000
+                    if fileAgeMs > ttlMs then
+                        -- Expired - quarantine
+                        quarantineFile(path, fname, "expired_ttl")
+                    end
                 end
             end
         end
-        handle:close()
     end
-    print("[MohoMCP] Discovered max ID: " .. tostring(lastSeenMaxId))
 end
 
 --- Start the file-based IPC server.
@@ -196,7 +302,9 @@ function server.start()
     end
 
     ipcDir = getIpcDir()
+    deadLetterDir = ipcDir .. "dead_letter" .. SEP
     mkdirp(ipcDir)
+    mkdirp(deadLetterDir)
 
     -- Verify directory is accessible
     local testPath = ipcDir .. ".mcp_test"
@@ -206,7 +314,9 @@ function server.start()
         local home = os.getenv("HOME") or os.getenv("USERPROFILE") or ""
         if home ~= "" then
             ipcDir = home .. SEP .. ".moho_mcp" .. SEP .. "ipc" .. SEP
+            deadLetterDir = ipcDir .. "dead_letter" .. SEP
             mkdirp(ipcDir)
+            mkdirp(deadLetterDir)
             testPath = ipcDir .. ".mcp_test"
             ok, err = writeFile(testPath, "ok")
         end
@@ -215,7 +325,9 @@ function server.start()
         if not ok then
             local tmp = os.getenv("TEMP") or os.getenv("TMP") or os.getenv("TMPDIR") or "/tmp"
             ipcDir = tmp .. SEP .. "moho-mcp" .. SEP
+            deadLetterDir = ipcDir .. "dead_letter" .. SEP
             mkdirp(ipcDir)
+            mkdirp(deadLetterDir)
             testPath = ipcDir .. ".mcp_test"
             ok, err = writeFile(testPath, "ok")
             if not ok then
@@ -226,22 +338,15 @@ function server.start()
     os.remove(testPath)
 
     -- Clean up any stale request/response files from previous sessions
-    local staleReqs = findFilesByPrefix(ipcDir, "req_")
-    for _, fname in ipairs(staleReqs) do
-        os.remove(ipcDir .. fname)
-    end
-    local staleResps = findFilesByPrefix(ipcDir, "resp_")
-    for _, fname in ipairs(staleResps) do
-        os.remove(ipcDir .. fname)
+    local files = listDir(ipcDir)
+    for _, fname in ipairs(files) do
+        if fname:match("^req_") or fname:match("^resp_") then
+            os.remove(ipcDir .. fname)
+        end
     end
 
-    -- Write a status file so the bridge knows we're running
-    writeFile(ipcDir .. "status.json", json.encode({
-        running = true,
-        pid = "moho",
-        version = "0.1.0",
-        startedAt = os.date("!%Y-%m-%dT%H:%M:%SZ"),
-    }))
+    -- Write initial health file
+    writeHealthFile()
 
     isRunning = true
     print("[MohoMCP] Server started. IPC directory: " .. ipcDir)
@@ -254,17 +359,16 @@ function server.stop()
         return
     end
 
-    -- Remove status file
+    -- Remove status and health files
     os.remove(ipcDir .. "status.json")
+    os.remove(ipcDir .. "health.json")
 
     -- Clean up any remaining files
-    local reqs = findFilesByPrefix(ipcDir, "req_")
-    for _, fname in ipairs(reqs) do
-        os.remove(ipcDir .. fname)
-    end
-    local resps = findFilesByPrefix(ipcDir, "resp_")
-    for _, fname in ipairs(resps) do
-        os.remove(ipcDir .. fname)
+    local files = listDir(ipcDir)
+    for _, fname in ipairs(files) do
+        if fname:match("^req_") or fname:match("^resp_") then
+            os.remove(ipcDir .. fname)
+        end
     end
 
     isRunning = false
@@ -274,6 +378,23 @@ end
 --- Check if the server is currently running.
 function server.isRunning()
     return isRunning
+end
+
+--- Get the current IPC directory path (for diagnostics).
+function server.getIpcDir()
+    return ipcDir
+end
+
+--- Get server info for diagnostics.
+function server.getInfo()
+    return {
+        running = isRunning,
+        ipcDir = ipcDir,
+        deadLetterDir = deadLetterDir,
+        lastProcessedSequence = lastProcessedSeq,
+        processedSequenceCount = 0, -- TODO: track size of processedSequences
+        protocolVersion = "1",
+    }
 end
 
 --- Process a single JSON-RPC request and return a response string.
@@ -319,30 +440,85 @@ local function processRequest(requestStr, moho)
 end
 
 --- Poll for incoming request files and process them.
--- Scans from 1 to maxProbedId so no request ID is ever skipped.
+-- Uses directory listing + cursor instead of linear ID scanning.
 function server.poll(moho)
     if not isRunning then
         return
     end
 
-    local maxProbedId = math.max(20, lastSeenMaxId + 20)
+    -- Periodic health file update
+    local now = os.clock() * 1000
+    if now - lastHealthWrite > HEALTH_WRITE_INTERVAL_MS then
+        writeHealthFile()
+        lastHealthWrite = now
+    end
 
-    for id = 1, maxProbedId do
-        local reqPath = ipcDir .. "req_" .. id .. ".json"
-        if fileExists(reqPath) then
-            if id > lastSeenMaxId then
-                lastSeenMaxId = id
-            end
+    -- Cleanup stale files periodically
+    cleanupStaleFiles()
 
-            local reqStr, err = readFile(reqPath)
+    -- List all request files
+    local files = listDir(ipcDir)
+    local requestFiles = {}
+
+    for _, fname in ipairs(files) do
+        local seq = parseSeqFromFilename(fname)
+        if seq and fname:match("^req_") then
+            requestFiles[#requestFiles + 1] = { seq = seq, fname = fname }
+        end
+    end
+
+    -- Sort by sequence number (ascending)
+    table.sort(requestFiles, function(a, b) return a.seq < b.seq end)
+
+    -- Process each request in order
+    for _, rf in ipairs(requestFiles) do
+        local seq = rf.seq
+        local fname = rf.fname
+        local reqPath = ipcDir .. fname
+        local respPath = ipcDir .. "resp_" .. seq .. ".json"
+
+        -- Skip if already processed (deduplication)
+        if processedSequences[seq] then
             os.remove(reqPath)
+            os.remove(respPath)
+            goto continue
+        end
 
-            if reqStr then
+        -- Read and remove request file
+        local reqStr, err = readFile(reqPath)
+        os.remove(reqPath)
+
+        if reqStr then
+            -- Check request size limit
+            if #reqStr > MAX_JSON_SIZE then
+                local errResp = protocol.createError(nil, protocol.INVALID_PARAMS,
+                    "Request payload exceeds maximum size of " .. MAX_JSON_SIZE .. " bytes")
+                writeFile(respPath, errResp)
+                quarantineFile(reqPath, fname, "oversized_request")
+            else
                 local respStr = processRequest(reqStr, moho)
-                local respPath = ipcDir .. "resp_" .. id .. ".json"
                 writeFile(respPath, respStr)
             end
         end
+
+        -- Mark as processed
+        processedSequences[seq] = true
+        lastProcessedSeq = math.max(lastProcessedSeq, seq)
+
+        -- Limit deduplication set size
+        local count = 0
+        for _ in pairs(processedSequences) do count = count + 1 end
+        if count > 10000 then
+            -- Keep only the most recent 5000
+            local keys = {}
+            for k in pairs(processedSequences) do keys[#keys + 1] = k end
+            table.sort(keys)
+            for i = 1, #keys - 5000 do
+                processedSequences[keys[i]] = nil
+            end
+        end
+
+        ::continue::
     end
 end
 
