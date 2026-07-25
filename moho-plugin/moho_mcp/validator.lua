@@ -33,6 +33,8 @@ local allowedMethods = {
     ["document.screenshot"]           = true,
     -- Batch execution
     ["batch.execute"]                 = true,
+    -- Workflows
+    ["workflow.createCountryball"]    = true,
 }
 
 -- Parameter schemas for each method.
@@ -122,6 +124,8 @@ local paramSchemas = {
     ["batch.execute"]          = {
         { name = "operations", type = "table" },
     },
+    -- Workflows (params optional)
+    ["workflow.createCountryball"] = {},
 }
 
 --- Check whether a method name is in the allow-list.

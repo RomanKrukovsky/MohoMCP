@@ -40,7 +40,7 @@ cp -f "$SRC/moho_mcp/validator.lua" "$DEST/moho_mcp/validator.lua"
 cp -f "$SRC/moho_mcp/validator.lua" "$SUB_DEST/moho_mcp/validator.lua"
 
 echo "Copying tool handlers..."
-for tool in document layer bone animation mesh batch; do
+for tool in document layer bone animation mesh batch workflow; do
     cp -f "$SRC/moho_mcp/tools/${tool}.lua" "$DEST/moho_mcp/tools/${tool}.lua"
     cp -f "$SRC/moho_mcp/tools/${tool}.lua" "$SUB_DEST/moho_mcp/tools/${tool}.lua"
 done
