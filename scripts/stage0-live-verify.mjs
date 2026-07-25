@@ -20,6 +20,9 @@ function getIpcDir() {
   if (process.env.MOHO_IPC_DIR) {
     return process.env.MOHO_IPC_DIR;
   }
+  if (fs.existsSync("/tmp/moho-mcp/status.json")) {
+    return "/tmp/moho-mcp";
+  }
   const platform = os.platform();
   if (platform === "darwin") {
     return path.join(os.homedir(), "Library", "Application Support", "MohoMCP", "ipc");
@@ -60,7 +63,7 @@ function readJsonFile(filePath) {
   }
 }
 
-async function waitForFile(filePath, timeoutMs = 5000) {
+async function waitForFile(filePath, timeoutMs = 30000) {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
     if (fs.existsSync(filePath)) {
@@ -102,7 +105,7 @@ async function runSmoke() {
   console.log(reqContent);
   console.log("\nAwaiting live Lua server response from Moho Pro 14 GUI...");
 
-  const found = await waitForFile(respPath, 6000);
+  const found = await waitForFile(respPath, 30000);
   if (!found) {
     console.log("\n[NOT EXECUTED / WAITING FOR MOHO GUI]");
     console.log("-> Please verify Moho Pro 14 is open with an active document.");
