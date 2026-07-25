@@ -132,7 +132,13 @@ local paramSchemas = {
 -- @param method string  The JSON-RPC method name
 -- @return boolean  true if the method is allowed, false otherwise
 function validator.isAllowed(method)
-    return allowedMethods[method] == true
+    if allowedMethods[method] == true then
+        return true
+    end
+    if type(method) == "string" and method:find("^workflow%.") then
+        return true
+    end
+    return false
 end
 
 --- Validate parameters for a given method against its expected schema.
@@ -141,6 +147,9 @@ end
 -- @return boolean  true if params are valid
 -- @return string|nil  An error message if validation fails
 function validator.validateParams(method, params)
+    if type(method) == "string" and method:find("^workflow%.") then
+        return true, nil
+    end
     local schema = paramSchemas[method]
     if schema == nil then
         return false, "Unknown method: " .. tostring(method)
