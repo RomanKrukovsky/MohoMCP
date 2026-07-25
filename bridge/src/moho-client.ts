@@ -87,6 +87,10 @@ export class MohoClient {
     }
   }
 
+  public get ipcDir(): string {
+    return config.moho.ipcDir;
+  }
+
   /**
    * "Connect" by verifying the IPC directory exists and MOHO's status file
    * indicates the server is running.
@@ -96,7 +100,7 @@ export class MohoClient {
       return;
     }
 
-    const { ipcDir } = config.moho;
+    const ipcDir = this.ipcDir;
 
     await this.detectLegacyTempDir();
 
@@ -149,7 +153,7 @@ export class MohoClient {
   disconnect(): void {
     stopKeepAlive();
     if (this.connected) {
-      const lockPath = path.join(config.moho.ipcDir, "client_lock.json");
+      const lockPath = path.join(this.ipcDir, "client_lock.json");
       fs.promises.unlink(lockPath).catch(() => {});
     }
     this.connected = false;
@@ -195,7 +199,8 @@ export class MohoClient {
       if (firstItem) this.executedRequestIds.delete(firstItem);
     }
 
-    const { ipcDir, pollInterval, requestTimeout, maxJsonSizeBytes } = config.moho;
+    const ipcDir = this.ipcDir;
+    const { pollInterval, requestTimeout, maxJsonSizeBytes } = config.moho;
     const timeout = options?.timeout ?? requestTimeout;
 
     const request = {

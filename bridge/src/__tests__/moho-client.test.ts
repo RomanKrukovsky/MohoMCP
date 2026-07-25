@@ -97,7 +97,7 @@ vi.mock("../config.js", () => ({
   config: {
     moho: {
       get ipcDir() {
-        return testIpcDir;
+        return process.env.MOHO_IPC_DIR || "/tmp/moho-mcp";
       },
       pollInterval: 20, // fast polling for tests
       requestTimeout: 2000, // 2s timeout for tests
@@ -119,6 +119,7 @@ describe("MohoClient", () => {
 
   beforeEach(() => {
     testIpcDir = createTestIpcDir();
+    process.env.MOHO_IPC_DIR = testIpcDir;
     client = new MohoClient();
   });
 
@@ -135,6 +136,7 @@ describe("MohoClient", () => {
     }
 
     cleanupTestIpcDir(testIpcDir);
+    delete process.env.MOHO_IPC_DIR;
   });
 
   // -------------------------------------------------------------------------
@@ -177,10 +179,9 @@ describe("MohoClient", () => {
       // Use a subdirectory that doesn't exist yet
       const subDir = path.join(testIpcDir, "sub", "dir");
       testIpcDir = subDir;
+      process.env.MOHO_IPC_DIR = subDir;
 
       // Write status file after creating the directory manually
-      // (connect() should create the dir first, then check for status)
-      // Since connect creates the dir, we need to pre-create and write status
       fs.mkdirSync(subDir, { recursive: true });
       writeStatusFile(subDir, true);
 
