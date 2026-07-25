@@ -73,9 +73,17 @@ end
 -- **************************************************
 
 local function loadModules(baseDir)
-	if MohoMCP_Server.isLoaded then
-		return true
-	end
+	-- Clear package.loaded cache to force fresh module reload
+	package.loaded["moho_mcp.protocol"] = nil
+	package.loaded["moho_mcp.validator"] = nil
+	package.loaded["moho_mcp.server"] = nil
+	package.loaded["moho_mcp.tools.document"] = nil
+	package.loaded["moho_mcp.tools.layer"] = nil
+	package.loaded["moho_mcp.tools.bone"] = nil
+	package.loaded["moho_mcp.tools.animation"] = nil
+	package.loaded["moho_mcp.tools.mesh"] = nil
+	package.loaded["moho_mcp.tools.batch"] = nil
+	package.loaded["moho_mcp.tools.workflow"] = nil
 
 	setupPackagePath(baseDir)
 
