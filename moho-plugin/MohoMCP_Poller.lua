@@ -56,15 +56,24 @@ end
 -- **************************************************
 
 function MohoMCP_Poller:DrawMe(moho, view)
-	if MohoMCP_Server and MohoMCP_Server.pollActive and MohoMCP_Server.server then
-		local pollOk, pollErr = pcall(MohoMCP_Server.server.poll, moho)
+	-- Auto-start MohoMCP_Server if not yet active
+	if not _G.MohoMCP_Server or not _G.MohoMCP_Server.pollActive then
+		pcall(function()
+			if _G.MohoMCP_Server and _G.MohoMCP_Server.IsEnabled then
+				_G.MohoMCP_Server:IsEnabled(moho)
+			end
+		end)
+	end
+
+	if _G.MohoMCP_Server and _G.MohoMCP_Server.pollActive and _G.MohoMCP_Server.server then
+		local pollOk, pollErr = pcall(_G.MohoMCP_Server.server.poll, moho)
 		if not pollOk then
 			print("[MohoMCP] Poll error: " .. tostring(pollErr))
 		end
 		-- Self-sustaining timer via UpdateUI (throttled to ~4Hz)
 		local now = os.clock()
-		if not MohoMCP_Server._lastPollTime or (now - MohoMCP_Server._lastPollTime) > 0.25 then
-			MohoMCP_Server._lastPollTime = now
+		if not _G.MohoMCP_Server._lastPollTime or (now - _G.MohoMCP_Server._lastPollTime) > 0.25 then
+			_G.MohoMCP_Server._lastPollTime = now
 			pcall(function() moho:UpdateUI() end)
 		end
 	end
