@@ -485,12 +485,13 @@ local function processRequest(requestStr, moho)
     local params = request.params or {}
     local id = request.id
 
-    if not validator.isAllowed(method) then
+    local valMod = validator or require("moho_mcp.validator")
+    if not valMod.isAllowed(method) then
         return protocol.createError(id, protocol.METHOD_NOT_FOUND,
             "Method not found: " .. tostring(method))
     end
 
-    local valid, validErr = validator.validateParams(method, params)
+    local valid, validErr = valMod.validateParams(method, params)
     if not valid then
         return protocol.createError(id, protocol.INVALID_PARAMS,
             validErr or "Invalid parameters")
