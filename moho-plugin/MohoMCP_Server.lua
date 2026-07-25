@@ -271,3 +271,30 @@ function MohoMCP_Server:Run(moho)
 		end
 	end
 end
+
+-- **************************************************
+-- Immediate Auto-Start on Moho Script Loading
+-- **************************************************
+
+function MohoMCP_Server:AutoStartOnLoad()
+	if not MohoMCP_Server._autoStarted then
+		MohoMCP_Server._autoStarted = true
+		if MohoMCP_Server.BASE_DIR == "" then
+			MohoMCP_Server.BASE_DIR = getScriptDir()
+		end
+		if loadModules(MohoMCP_Server.BASE_DIR) then
+			local srv = MohoMCP_Server.server
+			if srv and not srv.isRunning() then
+				local ok, err = srv.start()
+				if ok then
+					MohoMCP_Server.pollActive = true
+					installDrawMeHooks()
+					print("[MohoMCP] AUTO-STARTED server on Moho launch. IPC directory: " .. srv.getInfo().ipcDir)
+				end
+			end
+		end
+	end
+end
+
+-- Trigger auto-start immediately when Moho parses this script file on launch
+pcall(function() MohoMCP_Server:AutoStartOnLoad() end)
