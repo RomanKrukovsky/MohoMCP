@@ -35,7 +35,11 @@ function MohoMCP_Server:Creator()
 end
 
 function MohoMCP_Server:UILabel()
-	return "Start/Stop MohoMCP Server"
+	if MohoMCP_Server.server and MohoMCP_Server.server.isRunning() then
+		return "🟢 MohoMCP Server (Active - Click to Stop)"
+	else
+		return "🔴 MohoMCP Server (Click to Start)"
+	end
 end
 
 -- **************************************************
@@ -180,8 +184,6 @@ local function installDrawMeHooks()
 						print("[MohoMCP] Poll error (non-fatal): " .. tostring(pollErr))
 					end
 					-- Self-sustaining timer: call UpdateUI() throttled to ~4Hz
-					-- This triggers another DrawMe, keeping the poll loop alive
-					-- even when the user isn't interacting with the viewport
 					local now = os.clock()
 					if not MohoMCP_Server._lastPollTime or (now - MohoMCP_Server._lastPollTime) > 0.25 then
 						MohoMCP_Server._lastPollTime = now
@@ -200,11 +202,29 @@ end
 
 -- **************************************************
 -- IsEnabled — called by MOHO to update menu state.
--- We piggyback on this for reliable polling since it
--- fires periodically even without viewport interaction.
+-- Periodic heartbeat auto-starts server and executes polls.
 -- **************************************************
 
 function MohoMCP_Server:IsEnabled(moho)
+	-- Auto-start on first Moho heartbeat
+	if not MohoMCP_Server._autoStarted then
+		MohoMCP_Server._autoStarted = true
+		if MohoMCP_Server.BASE_DIR == "" then
+			MohoMCP_Server.BASE_DIR = getScriptDir()
+		end
+		if loadModules(MohoMCP_Server.BASE_DIR) then
+			local srv = MohoMCP_Server.server
+			if srv and not srv.isRunning() then
+				local ok, err = srv.start()
+				if ok then
+					MohoMCP_Server.pollActive = true
+					installDrawMeHooks()
+					print("[MohoMCP] Auto-started server. IPC directory: " .. srv.getInfo().ipcDir)
+				end
+			end
+		end
+	end
+
 	if MohoMCP_Server.pollActive and MohoMCP_Server.server then
 		local pollOk, pollErr = pcall(MohoMCP_Server.server.poll, moho)
 		if not pollOk then
@@ -215,25 +235,18 @@ function MohoMCP_Server:IsEnabled(moho)
 end
 
 -- **************************************************
--- The guts of this script
+-- The guts of this script — Toggle or Status
 -- **************************************************
 
 function MohoMCP_Server:Run(moho)
-	-- Determine base directory on first run
 	if MohoMCP_Server.BASE_DIR == "" then
 		MohoMCP_Server.BASE_DIR = getScriptDir()
 	end
 
-	-- Load modules on first run
 	if not MohoMCP_Server.isLoaded then
 		local loaded = loadModules(MohoMCP_Server.BASE_DIR)
 		if not loaded then
-			LM.GUI.Alert(LM.GUI.ALERT_WARNING,
-				"MohoMCP failed to load modules.",
-				"Check the script console (Window > Script Console) for details.",
-				nil,
-				MOHO.Localize("/Scripts/OK=OK"),
-				nil, nil)
+			print("[MohoMCP] ERROR: Failed to load modules.")
 			return
 		end
 	end
@@ -244,33 +257,17 @@ function MohoMCP_Server:Run(moho)
 		-- Stop the server
 		srv.stop()
 		MohoMCP_Server.pollActive = false
-		LM.GUI.Alert(LM.GUI.ALERT_INFO,
-			"MohoMCP Server stopped.",
-			nil, nil,
-			MOHO.Localize("/Scripts/OK=OK"),
-			nil, nil)
+		print("[MohoMCP] Server STOPPED.")
 	else
 		-- Start the server
 		local ok, err = srv.start()
 		if ok then
 			MohoMCP_Server.pollActive = true
-			-- Hook into all tool DrawMe callbacks for continuous polling
 			installDrawMeHooks()
-			-- Do an initial poll with the current moho reference
 			srv.poll(moho)
-			LM.GUI.Alert(LM.GUI.ALERT_INFO,
-				"MohoMCP Server started!",
-				"IPC directory: " .. srv.getInfo().ipcDir,
-				"Use Claude Desktop or Claude Code to connect.",
-				MOHO.Localize("/Scripts/OK=OK"),
-				nil, nil)
+			print("[MohoMCP] Server STARTED! IPC directory: " .. srv.getInfo().ipcDir)
 		else
-			LM.GUI.Alert(LM.GUI.ALERT_WARNING,
-				"MohoMCP Server failed to start.",
-				tostring(err),
-				nil,
-				MOHO.Localize("/Scripts/OK=OK"),
-				nil, nil)
+			print("[MohoMCP] Server start error: " .. tostring(err))
 		end
 	end
 end
